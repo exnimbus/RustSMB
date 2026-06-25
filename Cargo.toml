@@ -3,8 +3,8 @@ name = "smb-server"
 version = "0.4.1"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/paltaio/rust-smb-server"
+license-file = "LICENSE"
+repository = "https://github.com/exnimbus/RustSMB"
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
 
 [workspace]
@@ -20,8 +20,8 @@ members = [
 version = "0.4.1"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/paltaio/rust-smb-server"
+license-file = "LICENSE"
+repository = "https://github.com/exnimbus/RustSMB"
 
 [workspace.dependencies]
 smb-server = { path = ".", version = "0.4.1" }
