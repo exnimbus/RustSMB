@@ -35,6 +35,7 @@ async fn register_session(
         state.config.server_guid,
         state.config.max_read_size,
         state.config.max_write_size,
+        state.config.max_credits,
     ));
     state.active_connections.register(&conn).await;
 

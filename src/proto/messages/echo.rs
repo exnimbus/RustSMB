@@ -3,7 +3,7 @@
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 #[binrw]
 #[brw(little)]
@@ -41,7 +41,11 @@ impl Default for EchoResponse {
 
 impl EchoRequest {
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        let request = Self::read(&mut Cursor::new(buf))?;
+        if request.structure_size != 4 {
+            return Err(ProtoError::Malformed("echo request structure_size != 4"));
+        }
+        Ok(request)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -53,7 +57,11 @@ impl EchoRequest {
 
 impl EchoResponse {
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        let response = Self::read(&mut Cursor::new(buf))?;
+        if response.structure_size != 4 {
+            return Err(ProtoError::Malformed("echo response structure_size != 4"));
+        }
+        Ok(response)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -79,5 +87,23 @@ mod tests {
         let mut buf = Vec::new();
         resp.write_to(&mut buf).unwrap();
         assert_eq!(EchoResponse::parse(&buf).unwrap(), resp);
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let buf = [5, 0, 0, 0];
+        assert!(matches!(
+            EchoRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let buf = [5, 0, 0, 0];
+        assert!(matches!(
+            EchoResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

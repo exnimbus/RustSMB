@@ -4,6 +4,7 @@
 //! 1. **HMAC-SHA-256** for SMB 2.0.2 / 2.1 / 3.0 negotiating without 3.x
 //!    signing.
 //! 2. **AES-CMAC** for SMB 3.0+.
+//! 3. **AES-GMAC** for SMB 3.1.1 signing-capability negotiation.
 //!
 //! Both produce a 16-byte signature that lives at bytes 48..64 of the SMB2
 //! header (the `Signature` field, MS-SMB2 §2.2.1.2).
@@ -14,6 +15,8 @@
 //! 3. Place the first 16 bytes of MAC at bytes 48..64.
 
 use aes::Aes128;
+use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{AeadInPlace, KeyInit, generic_array::GenericArray};
 use cmac::Cmac;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -35,6 +38,8 @@ pub enum SigningAlgo {
     HmacSha256,
     /// AES-CMAC over AES-128, used by SMB 3.0+.
     AesCmac,
+    /// AES-GMAC over AES-128-GCM, negotiated with SMB 3.1.1 signing capabilities.
+    AesGmac,
 }
 
 /// Compute the 16-byte MAC over `msg` as if the SMB2 signature field were
@@ -64,8 +69,46 @@ fn compute_mac_zeroed_signature(msg: &[u8], key: &[u8; 16], algo: SigningAlgo) -
             let full = mac.finalize().into_bytes();
             out.copy_from_slice(&full[..SIG_LEN]);
         }
+        SigningAlgo::AesGmac => {
+            out.copy_from_slice(&compute_gmac_zeroed_signature(msg, key, true));
+        }
     }
     out
+}
+
+fn compute_gmac_zeroed_signature(msg: &[u8], key: &[u8; 16], server: bool) -> [u8; SIG_LEN] {
+    let mut pkt = Vec::with_capacity(msg.len());
+    pkt.extend_from_slice(&msg[..SIG_OFF]);
+    pkt.extend_from_slice(&[0u8; SIG_LEN]);
+    pkt.extend_from_slice(&msg[SIG_OFF + SIG_LEN..]);
+    // The SIGNED flag is part of the signed bytes. Callers normally set it
+    // before signing, but forcing it here matches GoSMB and SMB signing rules.
+    pkt[16] |= 0x08;
+
+    let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
+    let nonce = gmac_signing_nonce(&pkt, server);
+    let mut empty = Vec::new();
+    let tag = cipher
+        .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &pkt, &mut empty)
+        .expect("AES-GMAC over empty plaintext cannot fail");
+    let mut out = [0u8; SIG_LEN];
+    out.copy_from_slice(&tag);
+    out
+}
+
+fn gmac_signing_nonce(packet: &[u8], server: bool) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[0..8].copy_from_slice(&packet[24..32]);
+    let command = u16::from_le_bytes([packet[12], packet[13]]);
+    let mut flags = 0u32;
+    if server {
+        flags |= 1;
+    }
+    if command == 0x000c {
+        flags |= 2;
+    }
+    nonce[8..12].copy_from_slice(&flags.to_le_bytes());
+    nonce
 }
 
 /// Compute and embed a signature in `msg`. Mutates `msg` in place.
@@ -100,7 +143,10 @@ pub fn verify(msg: &[u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()> 
     let mut embedded = [0u8; SIG_LEN];
     embedded.copy_from_slice(&msg[SIG_OFF..SIG_OFF + SIG_LEN]);
 
-    let computed = compute_mac_zeroed_signature(msg, key, algo);
+    let computed = match algo {
+        SigningAlgo::AesGmac => compute_gmac_zeroed_signature(msg, key, false),
+        _ => compute_mac_zeroed_signature(msg, key, algo),
+    };
 
     if constant_time_eq(&embedded, &computed) {
         Ok(())
@@ -164,6 +210,47 @@ mod tests {
         sign(&mut msg, &key, SigningAlgo::AesCmac).expect("sign ok");
         assert_ne!(&msg[SIG_OFF..SIG_OFF + SIG_LEN], &[0u8; 16]);
         verify(&msg, &key, SigningAlgo::AesCmac).expect("verify ok");
+    }
+
+    #[test]
+    fn aes_gmac_response_direction_differs_from_client_direction() {
+        let key = *b"0123456789abcdef";
+        let mut msg = fixture_message();
+        msg[24..32].copy_from_slice(&42u64.to_le_bytes());
+        sign(&mut msg, &key, SigningAlgo::AesGmac).expect("sign ok");
+        assert_ne!(&msg[SIG_OFF..SIG_OFF + SIG_LEN], &[0u8; 16]);
+
+        let mut embedded = [0u8; SIG_LEN];
+        embedded.copy_from_slice(&msg[SIG_OFF..SIG_OFF + SIG_LEN]);
+        assert_eq!(embedded, compute_gmac_zeroed_signature(&msg, &key, true));
+        assert_ne!(embedded, compute_gmac_zeroed_signature(&msg, &key, false));
+    }
+
+    #[test]
+    fn aes_gmac_nonce_matches_gosmb_cancel_direction_bits() {
+        let mut msg = fixture_message();
+        msg[12..14].copy_from_slice(&0x000c_u16.to_le_bytes());
+        msg[24..32].copy_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
+
+        let client_nonce = gmac_signing_nonce(&msg, false);
+        assert_eq!(
+            u64::from_le_bytes(client_nonce[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(
+            u32::from_le_bytes(client_nonce[8..12].try_into().unwrap()),
+            0x0000_0002
+        );
+
+        let server_nonce = gmac_signing_nonce(&msg, true);
+        assert_eq!(
+            u64::from_le_bytes(server_nonce[0..8].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(
+            u32::from_le_bytes(server_nonce[8..12].try_into().unwrap()),
+            0x0000_0003
+        );
     }
 
     #[test]

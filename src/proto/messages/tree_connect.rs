@@ -1,9 +1,9 @@
 //! TREE_CONNECT Request/Response (MS-SMB2 §2.2.9 / §2.2.10).
 
-use binrw::{BinRead, BinWrite, binrw};
+use binrw::{BinWrite, binrw};
 use std::io::Cursor;
 
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 /// SMB2_TREE_CONNECT_REQUEST (MS-SMB2 §2.2.9).
 ///
@@ -49,7 +49,40 @@ impl TreeConnectRequest {
     }
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 8 {
+            return Err(ProtoError::Malformed("tree connect request too short"));
+        }
+        let structure_size = read_u16(buf, 0)?;
+        if structure_size != 9 {
+            return Err(ProtoError::Malformed(
+                "tree connect request structure_size != 9",
+            ));
+        }
+        let path_offset = read_u16(buf, 4)?;
+        let path_length = read_u16(buf, 6)?;
+        if path_length % 2 != 0 {
+            return Err(ProtoError::Malformed(
+                "tree connect request path length is not UTF-16 aligned",
+            ));
+        }
+        let offset = (path_offset as usize)
+            .checked_sub(crate::proto::header::SMB2_HEADER_LEN)
+            .ok_or(ProtoError::Malformed(
+                "tree connect path offset before SMB2 body",
+            ))?;
+        let end = offset
+            .checked_add(path_length as usize)
+            .ok_or(ProtoError::Malformed("tree connect path range overflow"))?;
+        if offset < 8 || end > buf.len() {
+            return Err(ProtoError::Malformed("tree connect path out of range"));
+        }
+        Ok(Self {
+            structure_size,
+            flags: read_u16(buf, 2)?,
+            path_offset,
+            path_length,
+            path: buf[offset..end].to_vec(),
+        })
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -77,9 +110,30 @@ impl TreeConnectResponse {
     pub const SHARE_TYPE_DISK: u8 = 0x01;
     pub const SHARE_TYPE_PIPE: u8 = 0x02;
     pub const SHARE_TYPE_PRINT: u8 = 0x03;
+    pub const SHARE_FLAG_MANUAL_CACHING: u32 = 0x0000_0000;
+    pub const SHARE_FLAG_NO_CACHING: u32 = 0x0000_0030;
+    pub const SHARE_FLAG_ENCRYPT_DATA: u32 = 0x0000_8000;
+    pub const SHARE_FLAG_COMPRESS_DATA: u32 = 0x0010_0000;
+    pub const SHARE_FLAG_ISOLATED_TRANSPORT: u32 = 0x0020_0000;
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 16 {
+            return Err(ProtoError::Malformed("tree connect response too short"));
+        }
+        let response = Self {
+            structure_size: read_u16(buf, 0)?,
+            share_type: read_u8(buf, 2)?,
+            reserved: read_u8(buf, 3)?,
+            share_flags: read_u32(buf, 4)?,
+            capabilities: read_u32(buf, 8)?,
+            maximal_access: read_u32(buf, 12)?,
+        };
+        if response.structure_size != 16 {
+            return Err(ProtoError::Malformed(
+                "tree connect response structure_size != 16",
+            ));
+        }
+        Ok(response)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -87,6 +141,26 @@ impl TreeConnectResponse {
         out.extend_from_slice(&c.into_inner());
         Ok(())
     }
+}
+
+fn read_u8(buf: &[u8], offset: usize) -> ProtoResult<u8> {
+    buf.get(offset)
+        .copied()
+        .ok_or(ProtoError::Malformed("tree connect u8 out of range"))
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> ProtoResult<u16> {
+    let bytes = buf
+        .get(offset..offset + 2)
+        .ok_or(ProtoError::Malformed("tree connect u16 out of range"))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> ProtoResult<u32> {
+    let bytes = buf
+        .get(offset..offset + 4)
+        .ok_or(ProtoError::Malformed("tree connect u32 out of range"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 #[cfg(test)]
@@ -115,6 +189,61 @@ mod tests {
     }
 
     #[test]
+    fn request_decodes_padded_path_from_header_relative_offset() {
+        let path = utf16le(r"\\server\share");
+        let mut buf = vec![0; 16 + path.len()];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[4..6]
+            .copy_from_slice(&(crate::proto::header::SMB2_HEADER_LEN as u16 + 16).to_le_bytes());
+        buf[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        buf[16..16 + path.len()].copy_from_slice(&path);
+
+        let decoded = TreeConnectRequest::parse(&buf).unwrap();
+
+        assert_eq!(decoded.path, path);
+        assert_eq!(decoded.path_str().unwrap(), r"\\server\share");
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 8];
+        buf[0..2].copy_from_slice(&8u16.to_le_bytes());
+
+        assert!(matches!(
+            TreeConnectRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn request_rejects_odd_path_length() {
+        let mut buf = vec![0; 9];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[4..6]
+            .copy_from_slice(&(crate::proto::header::SMB2_HEADER_LEN as u16 + 8).to_le_bytes());
+        buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+
+        assert!(matches!(
+            TreeConnectRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn request_rejects_path_out_of_range() {
+        let mut buf = vec![0; 8];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[4..6]
+            .copy_from_slice(&(crate::proto::header::SMB2_HEADER_LEN as u16 + 8).to_le_bytes());
+        buf[6..8].copy_from_slice(&2u16.to_le_bytes());
+
+        assert!(matches!(
+            TreeConnectRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn response_round_trips() {
         let r = TreeConnectResponse {
             structure_size: 16,
@@ -127,5 +256,16 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(TreeConnectResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 16];
+        buf[0..2].copy_from_slice(&15u16.to_le_bytes());
+
+        assert!(matches!(
+            TreeConnectResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

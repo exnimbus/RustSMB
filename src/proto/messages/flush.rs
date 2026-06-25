@@ -3,7 +3,7 @@
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 #[binrw]
 #[brw(little)]
@@ -28,6 +28,17 @@ impl FlushRequest {
             file_id_volatile: volatile,
         }
     }
+
+    pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
+        if buf.len() < 24 {
+            return Err(ProtoError::Malformed("flush request too short"));
+        }
+        let request = Self::read(&mut Cursor::new(buf))?;
+        if request.structure_size != 24 {
+            return Err(ProtoError::Malformed("flush request structure_size != 24"));
+        }
+        Ok(request)
+    }
 }
 
 #[binrw]
@@ -47,24 +58,34 @@ impl Default for FlushResponse {
     }
 }
 
-macro_rules! impl_codec {
-    ($t:ty) => {
-        impl $t {
-            pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-                Ok(<Self as BinRead>::read(&mut Cursor::new(buf))?)
-            }
-            pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
-                let mut c = Cursor::new(Vec::new());
-                BinWrite::write(self, &mut c)?;
-                out.extend_from_slice(&c.into_inner());
-                Ok(())
-            }
-        }
-    };
+impl FlushRequest {
+    pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
+        let mut c = Cursor::new(Vec::new());
+        BinWrite::write(self, &mut c)?;
+        out.extend_from_slice(&c.into_inner());
+        Ok(())
+    }
 }
 
-impl_codec!(FlushRequest);
-impl_codec!(FlushResponse);
+impl FlushResponse {
+    pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
+        if buf.len() < 4 {
+            return Err(ProtoError::Malformed("flush response too short"));
+        }
+        let response = Self::read(&mut Cursor::new(buf))?;
+        if response.structure_size != 4 {
+            return Err(ProtoError::Malformed("flush response structure_size != 4"));
+        }
+        Ok(response)
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
+        let mut c = Cursor::new(Vec::new());
+        BinWrite::write(self, &mut c)?;
+        out.extend_from_slice(&c.into_inner());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -82,5 +103,26 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(FlushResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 24];
+        buf[0..2].copy_from_slice(&23u16.to_le_bytes());
+
+        assert!(matches!(
+            FlushRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let buf = [3, 0, 0, 0];
+
+        assert!(matches!(
+            FlushResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

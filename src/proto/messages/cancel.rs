@@ -3,7 +3,7 @@
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 #[binrw]
 #[brw(little)]
@@ -24,7 +24,11 @@ impl Default for CancelRequest {
 
 impl CancelRequest {
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        let request = Self::read(&mut Cursor::new(buf))?;
+        if request.structure_size != 4 {
+            return Err(ProtoError::Malformed("cancel request structure_size != 4"));
+        }
+        Ok(request)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -45,5 +49,14 @@ mod tests {
         r.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), 4);
         assert_eq!(CancelRequest::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn rejects_wrong_structure_size() {
+        let buf = [5, 0, 0, 0];
+        assert!(matches!(
+            CancelRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

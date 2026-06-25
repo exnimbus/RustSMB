@@ -23,6 +23,8 @@ pub enum SmbError {
     Exists,
     #[error("not empty")]
     NotEmpty,
+    #[error("cannot delete")]
+    CannotDelete,
     #[error("is a directory")]
     IsDirectory,
     #[error("not a directory")]
@@ -46,6 +48,7 @@ impl SmbError {
             SmbError::AccessDenied => ntstatus::STATUS_ACCESS_DENIED,
             SmbError::Exists => ntstatus::STATUS_OBJECT_NAME_COLLISION,
             SmbError::NotEmpty => ntstatus::STATUS_DIRECTORY_NOT_EMPTY,
+            SmbError::CannotDelete => ntstatus::STATUS_CANNOT_DELETE,
             SmbError::IsDirectory => ntstatus::STATUS_FILE_IS_A_DIRECTORY,
             SmbError::NotADirectory => ntstatus::STATUS_NOT_A_DIRECTORY,
             SmbError::NameInvalid => ntstatus::STATUS_OBJECT_NAME_INVALID,
@@ -62,11 +65,12 @@ mod tests {
 
     #[test]
     fn nt_status_table_matches_spec() {
-        assert_eq!(SmbError::NotFound.to_nt_status(), 0xC000_000F);
+        assert_eq!(SmbError::NotFound.to_nt_status(), 0xC000_0034);
         assert_eq!(SmbError::PathNotFound.to_nt_status(), 0xC000_003A);
         assert_eq!(SmbError::AccessDenied.to_nt_status(), 0xC000_0022);
         assert_eq!(SmbError::Exists.to_nt_status(), 0xC000_0035);
         assert_eq!(SmbError::NotEmpty.to_nt_status(), 0xC000_0101);
+        assert_eq!(SmbError::CannotDelete.to_nt_status(), 0xC000_0121);
         assert_eq!(SmbError::IsDirectory.to_nt_status(), 0xC000_00BA);
         assert_eq!(SmbError::NotADirectory.to_nt_status(), 0xC000_0103);
         assert_eq!(SmbError::NameInvalid.to_nt_status(), 0xC000_0033);

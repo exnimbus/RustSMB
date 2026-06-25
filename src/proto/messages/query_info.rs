@@ -4,7 +4,7 @@ use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
 use super::create::FileId;
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 /// `InfoType` values (MS-SMB2 §2.2.37 InfoType field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +65,50 @@ impl QueryInfoRequest {
     }
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 40 {
+            return Err(ProtoError::Malformed("query info request too short"));
+        }
+        let structure_size = read_u16(buf, 0)?;
+        if structure_size != 41 {
+            return Err(ProtoError::Malformed(
+                "query info request structure_size != 41",
+            ));
+        }
+        let input_buffer_offset = read_u16(buf, 8)?;
+        let input_buffer_length = read_u32(buf, 12)?;
+        let input_buffer = if input_buffer_length == 0 {
+            Vec::new()
+        } else {
+            let offset = (input_buffer_offset as usize)
+                .checked_sub(crate::proto::header::SMB2_HEADER_LEN)
+                .ok_or(ProtoError::Malformed(
+                    "query info input buffer offset before SMB2 body",
+                ))?;
+            let length = input_buffer_length as usize;
+            let end = offset
+                .checked_add(length)
+                .ok_or(ProtoError::Malformed("query info input buffer overflow"))?;
+            if offset < 40 || end > buf.len() {
+                return Err(ProtoError::Malformed(
+                    "query info input buffer out of range",
+                ));
+            }
+            buf[offset..end].to_vec()
+        };
+
+        Ok(Self {
+            structure_size,
+            info_type: buf[2],
+            file_information_class: buf[3],
+            output_buffer_length: read_u32(buf, 4)?,
+            input_buffer_offset,
+            reserved: read_u16(buf, 10)?,
+            input_buffer_length,
+            additional_information: read_u32(buf, 16)?,
+            flags: read_u32(buf, 20)?,
+            file_id: FileId::new(read_u64(buf, 24)?, read_u64(buf, 32)?),
+            input_buffer,
+        })
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -89,7 +132,13 @@ pub struct QueryInfoResponse {
 
 impl QueryInfoResponse {
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        let response = Self::read(&mut Cursor::new(buf))?;
+        if response.structure_size != 9 {
+            return Err(ProtoError::Malformed(
+                "query info response structure_size != 9",
+            ));
+        }
+        Ok(response)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -97,6 +146,29 @@ impl QueryInfoResponse {
         out.extend_from_slice(&c.into_inner());
         Ok(())
     }
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> ProtoResult<u16> {
+    let bytes = buf
+        .get(offset..offset + 2)
+        .ok_or(ProtoError::Malformed("query info u16 out of range"))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> ProtoResult<u32> {
+    let bytes = buf
+        .get(offset..offset + 4)
+        .ok_or(ProtoError::Malformed("query info u32 out of range"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> ProtoResult<u64> {
+    let bytes = buf
+        .get(offset..offset + 8)
+        .ok_or(ProtoError::Malformed("query info u64 out of range"))?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
 }
 
 #[cfg(test)]
@@ -136,5 +208,63 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(QueryInfoResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn request_decodes_file_id_and_padded_input_buffer() {
+        let mut buf = vec![0; 48];
+        buf[0..2].copy_from_slice(&41u16.to_le_bytes());
+        buf[2] = InfoType::Security as u8;
+        buf[4..8].copy_from_slice(&1024u32.to_le_bytes());
+        buf[8..10]
+            .copy_from_slice(&(crate::proto::header::SMB2_HEADER_LEN as u16 + 44).to_le_bytes());
+        buf[12..16].copy_from_slice(&4u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&0x07u32.to_le_bytes());
+        buf[20..24].copy_from_slice(&0x02u32.to_le_bytes());
+        buf[24..32].copy_from_slice(&33u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&44u64.to_le_bytes());
+        buf[44..48].copy_from_slice(&[1, 2, 3, 4]);
+
+        let decoded = QueryInfoRequest::parse(&buf).unwrap();
+
+        assert_eq!(decoded.file_id, FileId::new(33, 44));
+        assert_eq!(decoded.input_buffer, [1, 2, 3, 4]);
+        assert_eq!(decoded.additional_information, 0x07);
+        assert_eq!(decoded.flags, 0x02);
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 40];
+        buf[0..2].copy_from_slice(&40u16.to_le_bytes());
+
+        assert!(matches!(
+            QueryInfoRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn request_rejects_input_buffer_out_of_range() {
+        let mut buf = vec![0; 40];
+        buf[0..2].copy_from_slice(&41u16.to_le_bytes());
+        buf[8..10]
+            .copy_from_slice(&(crate::proto::header::SMB2_HEADER_LEN as u16 + 40).to_le_bytes());
+        buf[12..16].copy_from_slice(&1u32.to_le_bytes());
+
+        assert!(matches!(
+            QueryInfoRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let buf = [8, 0, 0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(
+            QueryInfoResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

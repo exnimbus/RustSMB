@@ -9,7 +9,8 @@ use std::str::FromStr;
 
 use crate::error::{SmbError, SmbResult};
 
-/// A validated, component-list path. No `..`, no Windows-forbidden chars, no
+/// A validated, component-list path. `..` components are normalized without
+/// allowing escape above the share root. No Windows-forbidden chars, no
 /// alternate streams. Always relative to the share root — the empty path is
 /// the root.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -56,7 +57,8 @@ impl SmbPath {
             }
         }
 
-        // 3. Split on `\` or `/`; reject `..` and empty components; skip `.`.
+        // 3. Split on `\` or `/`; normalize `..`, reject empty components,
+        // skip `.`.
         let mut components = Vec::new();
         for raw in trimmed.split(['\\', '/']) {
             if raw.is_empty() {
@@ -67,7 +69,10 @@ impl SmbPath {
                 continue;
             }
             if raw == ".." {
-                return Err(SmbError::NameInvalid);
+                if components.pop().is_none() {
+                    return Err(SmbError::NameInvalid);
+                }
+                continue;
             }
             // 4. Reject reserved DOS device names.
             if is_reserved_dos_name(raw) {
@@ -223,9 +228,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_double_dot() {
-        assert!("a\\..\\b".parse::<SmbPath>().is_err());
+    fn normalizes_double_dot_without_escaping_share_root() {
+        let p = "a\\..\\b".parse::<SmbPath>().unwrap();
+        assert_eq!(p.components(), &["b"]);
         assert!("..".parse::<SmbPath>().is_err());
+        assert!("a\\..\\..".parse::<SmbPath>().is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! SMB signing, key derivation, pre-auth integrity.
 //!
 //! Submodules:
+//! * [`compression`] — SMB 3.1.1 compression transform helpers.
 //! * [`kdf`]     — SP 800-108 CTR-mode KDF (`SMB2KDF`) and SMB-specific
 //!   signing/application key helpers (MS-SMB2 §3.1.4.2).
 //! * [`sign`]    — HMAC-SHA-256 (SMB 2.x) and AES-CMAC (SMB 3.x) signing of
@@ -11,10 +12,13 @@
 //! Encryption (AES-CCM/AES-GCM) is intentionally out of scope for v1; see the
 //! design spec.
 
+pub mod compression;
+pub mod encryption;
 pub mod kdf;
 pub mod preauth;
 pub mod sign;
 
+pub use compression::{compress_response, decompress_transform, is_compression_transform};
 pub use kdf::{signing_key_30, signing_key_311};
 pub use preauth::PreauthIntegrity;
 pub use sign::{SigningAlgo, sign, verify};

@@ -41,10 +41,14 @@ pub use ioctl::{Fsctl, IoctlRequest, IoctlResponse};
 pub use lock::{LockElement, LockRequest, LockResponse};
 pub use logoff::{LogoffRequest, LogoffResponse};
 pub use negotiate::{
-    Dialect, EncryptionCapabilities, NegotiateContext, NegotiateContextData, NegotiateRequest,
-    NegotiateResponse, PreauthIntegrityCapabilities, SigningCapabilities,
+    CompressionCapabilities, Dialect, EncryptionCapabilities, NegotiateContext,
+    NegotiateContextData, NegotiateRequest, NegotiateResponse, PreauthIntegrityCapabilities,
+    RdmaTransformCapabilities, SigningCapabilities,
 };
-pub use oplock_break::{OplockBreakAck, OplockBreakNotification};
+pub use oplock_break::{
+    LeaseBreakAck, LeaseBreakNotification, LeaseBreakResponse, OplockBreakAck,
+    OplockBreakNotification,
+};
 pub use query_directory::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};
 pub use query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
 pub use read::{ReadRequest, ReadResponse};

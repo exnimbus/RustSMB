@@ -175,6 +175,9 @@ pub struct NegTokenInit {
     pub mech_types: Vec<Vec<u8>>,
     /// `mechToken [2]` if present — typically the NTLMSSP NEGOTIATE_MESSAGE bytes.
     pub mech_token: Option<Vec<u8>>,
+    /// Full DER-encoded MechTypeList sequence used as the NTLM mechListMIC
+    /// signing input on the final SPNEGO accept.
+    pub mech_list: Vec<u8>,
 }
 
 /// Decoded `NegTokenResp` payload.
@@ -214,6 +217,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
     let mut pos = 0usize;
     let mut mech_types: Vec<Vec<u8>> = Vec::new();
     let mut mech_token: Option<Vec<u8>> = None;
+    let mut mech_list = Vec::new();
 
     while pos < seq_body.len() {
         let (tag, content, next) = read_any_tlv(seq_body, pos)?;
@@ -221,6 +225,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
             TAG_CTX_0 => {
                 // mechTypes [0] MechTypeList ::= SEQUENCE OF MechType (OID)
                 let (mt_seq, _) = read_tlv(content, 0, TAG_SEQUENCE)?;
+                mech_list = content.to_vec();
                 let mut p = 0usize;
                 while p < mt_seq.len() {
                     let (oid, e) = read_tlv(mt_seq, p, TAG_OBJECT)?;
@@ -249,6 +254,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
     Ok(NegTokenInit {
         mech_types,
         mech_token,
+        mech_list,
     })
 }
 
@@ -419,6 +425,20 @@ mod tests {
         assert_eq!(init.mech_types.len(), 1);
         assert_eq!(init.mech_types[0], OID_NTLMSSP);
         assert!(init.mech_token.is_none());
+        assert_eq!(
+            init.mech_list,
+            [
+                0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a
+            ]
+        );
+    }
+
+    #[test]
+    fn init_response_advertises_ntlm_only_without_optimistic_token() {
+        let init = decode_init_token(&encode_init_response()).unwrap();
+        assert!(init.mech_token.is_none());
+        assert!(!init.mech_list.is_empty());
+        assert_eq!(init.mech_types, vec![OID_NTLMSSP.to_vec()]);
     }
 
     #[test]
@@ -434,6 +454,24 @@ mod tests {
         assert_eq!(dec.neg_state, Some(NegState::AcceptIncomplete));
         assert_eq!(dec.supported_mech.as_deref(), Some(OID_NTLMSSP));
         assert_eq!(dec.response_token.as_deref(), Some(&payload[..]));
+        assert!(dec.mech_list_mic.is_none());
+    }
+
+    #[test]
+    fn resp_token_uses_explicit_neg_token_resp_wrapper() {
+        let enc = encode_resp_token(
+            NegState::AcceptIncomplete,
+            Some(OID_NTLMSSP),
+            Some(b"challenge"),
+            None,
+        );
+
+        assert!(enc.len() >= 4);
+        assert_eq!(enc[0], TAG_CTX_1);
+        assert_eq!(enc[2], TAG_SEQUENCE);
+
+        let dec = decode_resp_token(&enc).unwrap();
+        assert_eq!(dec.response_token.as_deref(), Some(&b"challenge"[..]));
         assert!(dec.mech_list_mic.is_none());
     }
 
@@ -495,6 +533,12 @@ mod tests {
         assert_eq!(dec.mech_types.len(), 1);
         assert_eq!(dec.mech_types[0], OID_NTLMSSP);
         assert_eq!(dec.mech_token.as_deref(), Some(&inner_token[..]));
+        assert_eq!(
+            dec.mech_list,
+            [
+                0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a
+            ]
+        );
     }
 
     #[test]

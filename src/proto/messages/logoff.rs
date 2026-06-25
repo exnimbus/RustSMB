@@ -3,7 +3,7 @@
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 #[binrw]
 #[brw(little)]
@@ -43,7 +43,11 @@ macro_rules! impl_codec {
     ($t:ty) => {
         impl $t {
             pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-                Ok(<Self as BinRead>::read(&mut Cursor::new(buf))?)
+                let message = <Self as BinRead>::read(&mut Cursor::new(buf))?;
+                if message.structure_size != 4 {
+                    return Err(ProtoError::Malformed("logoff structure_size != 4"));
+                }
+                Ok(message)
             }
             pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
                 let mut c = Cursor::new(Vec::new());
@@ -73,5 +77,23 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(LogoffResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let buf = [5, 0, 0, 0];
+        assert!(matches!(
+            LogoffRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let buf = [5, 0, 0, 0];
+        assert!(matches!(
+            LogoffResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

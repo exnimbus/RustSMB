@@ -12,6 +12,8 @@ resolver = "2"
 members = [
     ".",
     "examples/minimal",
+    "examples/hnfs",
+    "examples/smbperf",
 ]
 
 [workspace.package]
@@ -32,6 +34,7 @@ tracing = "0.1"
 thiserror = "1"
 uuid = { version = "1.10", features = ["v4"] }
 cap-std = "3"
+quinn = "0.11.9"
 
 # RustCrypto family
 hmac  = "0.12"
@@ -39,6 +42,7 @@ sha2  = "0.10"
 md-5  = "0.10"
 md4   = "0.10"
 aes   = "0.8"
+aes-gcm = "0.10"
 cmac  = "0.7"
 rc4   = "0.2"
 
@@ -57,23 +61,28 @@ binrw = { workspace = true }
 # 3.1.1 negotiate-context salt.
 getrandom = "0.4"
 cap-std = { workspace = true, optional = true }
+notify = { version = "8.2", optional = true }
+quinn = { workspace = true, optional = true }
 hmac.workspace = true
 sha2.workspace = true
 md-5.workspace = true
 md4.workspace = true
 aes.workspace = true
+aes-gcm.workspace = true
 cmac.workspace = true
 rc4.workspace = true
 
 [features]
 default = ["localfs"]
-localfs = ["dep:cap-std"]
+localfs = ["dep:cap-std", "dep:notify"]
+quic = ["dep:quinn"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = "0.3"
 tempfile = "3"
 hex = "0.4"
+rcgen = "0.14"
 
 [[test]]
 name = "integration_localfs"

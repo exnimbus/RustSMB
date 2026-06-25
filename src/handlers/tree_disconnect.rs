@@ -7,12 +7,12 @@ use crate::proto::messages::TreeDisconnectResponse;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::lookup_session;
+use crate::handlers::shared::lookup_session_tree;
 use crate::ntstatus;
 use crate::server::ServerState;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     _body: &[u8],
@@ -22,9 +22,54 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
 
-    if lookup_session(conn, hdr.session_id).await.is_err() {
-        return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
-    }
+    let tree_arc = match lookup_session_tree(conn, hdr).await {
+        Ok(tree) => tree,
+        Err(status) => return HandlerResponse::err(status),
+    };
+    server
+        .cleanup_change_notifies_for_tree(
+            conn,
+            hdr.session_id,
+            tid,
+            ntstatus::STATUS_NOTIFY_CLEANUP,
+        )
+        .await;
+    server
+        .cleanup_pipe_reads_for_tree(conn, hdr.session_id, tid, ntstatus::STATUS_NOTIFY_CLEANUP)
+        .await;
+    server
+        .cleanup_byte_range_lock_waits_for_tree(
+            conn,
+            hdr.session_id,
+            tid,
+            ntstatus::STATUS_NOTIFY_CLEANUP,
+        )
+        .await;
+    server
+        .cleanup_cache_break_creates_for_tree(
+            conn,
+            hdr.session_id,
+            tid,
+            ntstatus::STATUS_NOTIFY_CLEANUP,
+        )
+        .await;
+    server
+        .cleanup_cache_break_writes_for_tree(
+            conn,
+            hdr.session_id,
+            tid,
+            ntstatus::STATUS_NOTIFY_CLEANUP,
+        )
+        .await;
+    server
+        .cleanup_cache_break_tasks_for_tree(
+            conn,
+            hdr.session_id,
+            tid,
+            ntstatus::STATUS_NOTIFY_CLEANUP,
+        )
+        .await;
+    server.cleanup_tree_disconnect_opens(conn, &tree_arc).await;
     if !conn.close_tree(hdr.session_id, tid).await {
         return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }

@@ -112,6 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn direct_tcp_round_trip_matches_gosmb_fixture() {
+        let payload = [
+            0xfe, b'S', b'M', b'B', b'p', b'a', b'y', b'l', b'o', b'a', b'd',
+        ];
+        let mut wire = Vec::new();
+        encode_frame(&payload, &mut wire);
+
+        assert_eq!(&wire[..4], &[0x00, 0x00, 0x00, payload.len() as u8]);
+        let (decoded, rest) = decode_frame(&wire).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
     fn decodes_header_three_byte_length() {
         // 0x00_12_34_56 -> length 0x123456
         let len = decode_frame_header(&[0x00, 0x12, 0x34, 0x56]).unwrap();

@@ -1,0 +1,11 @@
+[package]
+name = "smbperf"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+smb-server = { workspace = true, features = ["quic"] }
+tokio = { workspace = true }
+binrw = { workspace = true }
+quinn = { workspace = true }

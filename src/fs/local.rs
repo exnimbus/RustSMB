@@ -17,7 +17,7 @@
 
 use std::io;
 use std::os::unix::fs::FileExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,11 +25,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind};
 use tokio::task::spawn_blocking;
 
 use crate::backend::{
-    BackendCapabilities, DirEntry as SmbDirEntry, FileInfo, FileTimes, Handle, OpenIntent,
-    OpenOptions, ShareBackend,
+    BackendCapabilities, BackendWatch, DirEntry as SmbDirEntry, FileInfo, FileTimes, Handle,
+    OpenIntent, OpenOptions, ShareBackend, WATCH_CHANGE_ATTRIBUTES, WATCH_CHANGE_CREATION,
+    WATCH_CHANGE_LAST_ACCESS, WATCH_CHANGE_LAST_WRITE, WATCH_CHANGE_NAME, WATCH_CHANGE_SIZE,
+    WatchAction, WatchEvent, WatchRecord, default_file_attributes,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
@@ -43,6 +46,7 @@ use crate::path::SmbPath;
 /// Cheap to clone: internally an `Arc<cap_std::fs::Dir>` plus a flag.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
+    root_path: Arc<PathBuf>,
     read_only: bool,
 }
 
@@ -50,9 +54,11 @@ impl LocalFsBackend {
     /// Open `path` as the share root. Errors if the path does not exist or is
     /// not a directory.
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
-        let dir = Dir::open_ambient_dir(path, ambient_authority())?;
+        let root_path = std::fs::canonicalize(path.as_ref())?;
+        let dir = Dir::open_ambient_dir(&root_path, ambient_authority())?;
         Ok(Self {
             root: Arc::new(dir),
+            root_path: Arc::new(root_path),
             read_only: false,
         })
     }
@@ -137,12 +143,30 @@ fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
 }
 
+fn std_file_times_from_smb(times: FileTimes) -> std::fs::FileTimes {
+    let mut std_times = std::fs::FileTimes::new();
+    if let Some(ft) = times.last_write_time
+        && let Some(t) = filetime_to_system_time(ft)
+    {
+        std_times = std_times.set_modified(t);
+    }
+    if let Some(ft) = times.last_access_time
+        && let Some(t) = filetime_to_system_time(ft)
+    {
+        std_times = std_times.set_accessed(t);
+    }
+    // creation_time / change_time: stable std::fs::FileTimes does not expose
+    // setters for these; the server overlays them in metadata maps.
+    std_times
+}
+
 // ---------------------------------------------------------------------------
 // FileInfo construction
 // ---------------------------------------------------------------------------
 
 fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo {
-    let len = md.len();
+    let is_directory = md.is_dir();
+    let len = if is_directory { 0 } else { md.len() };
     let modified = md.modified().ok().map(|t| t.into_std());
     let accessed = md.accessed().ok().map(|t| t.into_std());
     let created = md.created().ok().map(|t| t.into_std());
@@ -165,11 +189,41 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
         last_access_time: system_time_to_filetime(accessed),
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
-        is_directory: md.is_dir(),
-        // `cap-std` does not expose a stable inode-style identifier in its
-        // public API; the dispatcher substitutes the FileId where needed.
-        file_index: 0,
+        is_directory,
+        file_index: file_index_from_metadata(md),
+        file_attributes: default_file_attributes(is_directory),
     }
+}
+
+#[cfg(any(unix, target_os = "vxworks"))]
+fn file_index_from_metadata(md: &cap_std::fs::Metadata) -> u64 {
+    use cap_std::fs::MetadataExt as _;
+
+    let ino = md.ino();
+    if ino == 0 {
+        return 0;
+    }
+
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for value in [md.dev(), ino] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+    hash.max(1)
+}
+
+#[cfg(windows)]
+fn file_index_from_metadata(md: &cap_std::fs::Metadata) -> u64 {
+    use cap_std::fs::MetadataExt as _;
+
+    md.file_index().unwrap_or(0)
+}
+
+#[cfg(not(any(unix, target_os = "vxworks", windows)))]
+fn file_index_from_metadata(_md: &cap_std::fs::Metadata) -> u64 {
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -225,26 +279,63 @@ fn ascii_eq_ci(a: char, b: char) -> bool {
 #[async_trait]
 impl ShareBackend for LocalFsBackend {
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
-        // 1. Read-only check: any open that requests creation, write access,
-        //    truncation, or overwrite is rejected up front. Pure read opens
-        //    pass through.
-        let writes = opts.write
-            || matches!(
-                opts.intent,
-                OpenIntent::Create
-                    | OpenIntent::OpenOrCreate
-                    | OpenIntent::OverwriteOrCreate
-                    | OpenIntent::Truncate
-            );
-        if self.read_only && writes {
-            return Err(SmbError::AccessDenied);
-        }
-
         let rel = to_rel_path(path);
         let root = Arc::clone(&self.root);
         let read_only = self.read_only;
         let directory = opts.directory;
         let non_directory = opts.non_directory;
+
+        if let Some(parent) = path.parent()
+            && !parent.is_root()
+        {
+            let parent_rel = to_rel_path(&parent);
+            let parent_root = Arc::clone(&self.root);
+            match spawn_blocking(move || -> io::Result<bool> {
+                parent_root.metadata(&parent_rel).map(|md| md.is_dir())
+            })
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(SmbError::NotADirectory),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(SmbError::PathNotFound);
+                }
+                Err(e) => return Err(io_to_smb(e)),
+            }
+        }
+
+        let existing_is_dir = {
+            let root = Arc::clone(&self.root);
+            let rel = rel.clone();
+            spawn_blocking(move || -> io::Result<Option<bool>> {
+                match root.metadata(&rel) {
+                    Ok(md) => Ok(Some(md.is_dir())),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)?
+        };
+        let exists = existing_is_dir.is_some();
+        let existing_is_dir = existing_is_dir.unwrap_or(false);
+
+        // 1. Read-only check: existing FILE_OPEN_IF opens are read-only when
+        // the client did not request data-modifying access. Missing files still
+        // require create/write permission.
+        let writes = opts.write
+            || matches!(
+                opts.intent,
+                OpenIntent::Create | OpenIntent::OverwriteOrCreate | OpenIntent::Truncate
+            )
+            || (matches!(opts.intent, OpenIntent::OpenOrCreate) && !exists);
+        if self.read_only && writes {
+            return Err(SmbError::AccessDenied);
+        }
 
         // For directories, cap-std exposes `open_dir` separately; we don't
         // need an OpenOptions translation in that case.
@@ -252,18 +343,20 @@ impl ShareBackend for LocalFsBackend {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
             let intent = opts.intent;
-            let dir_handle = spawn_blocking(move || -> io::Result<Dir> {
+            let local_path = Arc::new(self.root_path.join(&rel));
+            let dir_root = Arc::clone(&root);
+            let dir_rel = rel.clone();
+            spawn_blocking(move || -> io::Result<()> {
                 match intent {
-                    OpenIntent::Open => root.open_dir(&rel),
-                    OpenIntent::Create => {
-                        root.create_dir(&rel)?;
-                        root.open_dir(&rel)
-                    }
+                    OpenIntent::Open => dir_root.open_dir(&dir_rel).map(|_| ()),
+                    OpenIntent::Create => dir_root.create_dir(&dir_rel),
                     OpenIntent::OpenOrCreate => {
-                        if !root.exists(&rel) {
-                            root.create_dir(&rel)?;
+                        match dir_root.create_dir(&dir_rel) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(e) => return Err(e),
                         }
-                        root.open_dir(&rel)
+                        Ok(())
                     }
                     OpenIntent::Truncate | OpenIntent::OverwriteOrCreate => {
                         // Truncating a directory has no meaning; reject.
@@ -275,44 +368,31 @@ impl ShareBackend for LocalFsBackend {
             .map_err(join_to_io)
             .map_err(io_to_smb)?
             .map_err(io_to_smb)?;
+            let name = canonical_name_for_path(Arc::clone(&self.root), path.clone()).await?;
 
             return Ok(Box::new(LocalHandle::Dir {
-                name: file_name_for(path),
-                dir_handle: Arc::new(dir_handle),
+                name,
+                root: Arc::clone(&self.root),
+                rel,
+                local_path,
+                read_only,
             }));
         }
-
-        let existing_is_dir = {
-            let root = Arc::clone(&self.root);
-            let rel = rel.clone();
-            spawn_blocking(move || -> io::Result<bool> {
-                match root.metadata(&rel) {
-                    Ok(md) => Ok(md.is_dir()),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-                    Err(e) => Err(e),
-                }
-            })
-            .await
-            .map_err(join_to_io)
-            .map_err(io_to_smb)?
-            .map_err(io_to_smb)?
-        };
         if existing_is_dir {
             if non_directory {
                 return Err(SmbError::IsDirectory);
             }
             match opts.intent {
                 OpenIntent::Open | OpenIntent::OpenOrCreate => {
-                    let root = Arc::clone(&self.root);
-                    let rel = rel.clone();
-                    let dir_handle = spawn_blocking(move || root.open_dir(&rel))
-                        .await
-                        .map_err(join_to_io)
-                        .map_err(io_to_smb)?
-                        .map_err(io_to_smb)?;
+                    let local_path = Arc::new(self.root_path.join(&rel));
+                    let name =
+                        canonical_name_for_path(Arc::clone(&self.root), path.clone()).await?;
                     return Ok(Box::new(LocalHandle::Dir {
-                        name: file_name_for(path),
-                        dir_handle: Arc::new(dir_handle),
+                        name,
+                        root: Arc::clone(&self.root),
+                        rel,
+                        local_path,
+                        read_only,
                     }));
                 }
                 OpenIntent::Create => return Err(SmbError::Exists),
@@ -335,7 +415,11 @@ impl ShareBackend for LocalFsBackend {
                 cap_opts.read(opts.read).write(true).truncate(true);
             }
             OpenIntent::OpenOrCreate => {
-                cap_opts.read(opts.read).write(true).create(true);
+                if exists && !opts.write {
+                    cap_opts.read(true);
+                } else {
+                    cap_opts.read(opts.read).write(true).create(true);
+                }
             }
             OpenIntent::OverwriteOrCreate => {
                 cap_opts
@@ -357,9 +441,10 @@ impl ShareBackend for LocalFsBackend {
         // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`
         // without pulling in extra crates.
         let std_file: std::fs::File = cap_file.into_std();
+        let name = canonical_name_for_path(Arc::clone(&self.root), path.clone()).await?;
 
         Ok(Box::new(LocalHandle::File {
-            name: file_name_for(path),
+            name,
             file: Arc::new(std_file),
             read_only,
         }))
@@ -377,14 +462,9 @@ impl ShareBackend for LocalFsBackend {
         let root = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            match root.remove_file(&rel) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
-                    // Caller's intent was "delete this name"; if it turned
-                    // out to be a directory, fall back to remove_dir which
-                    // refuses non-empty dirs (mapped to NotEmpty above).
-                    root.remove_dir(&rel)
-                }
+            match root.metadata(&rel) {
+                Ok(md) if md.is_dir() => root.remove_dir(&rel),
+                Ok(_) => root.remove_file(&rel),
                 Err(e) => Err(e),
             }
         })
@@ -428,6 +508,248 @@ impl ShareBackend for LocalFsBackend {
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
         }
     }
+
+    async fn watch(&self, path: &SmbPath, recursive: bool) -> SmbResult<Option<BackendWatch>> {
+        use notify::{RecursiveMode, Watcher};
+
+        let root_path = Arc::clone(&self.root_path);
+        let watch_path = root_path.join(to_rel_path(path));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let event_handler = move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else {
+                return;
+            };
+            let events = local_notify_event_to_smb(&root_path, event);
+            for event in events {
+                let _ = tx.try_send(event);
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let mut watcher = notify::PollWatcher::new(
+            event_handler,
+            notify::Config::default().with_poll_interval(Duration::from_millis(100)),
+        )
+        .map_err(|e| SmbError::Io(io::Error::other(e.to_string())))?;
+        #[cfg(not(target_os = "macos"))]
+        let mut watcher = notify::recommended_watcher(event_handler)
+            .map_err(|e| SmbError::Io(io::Error::other(e.to_string())))?;
+        let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher
+            .watch(&watch_path, mode)
+            .map_err(|e| SmbError::Io(io::Error::other(e.to_string())))?;
+
+        Ok(Some(BackendWatch::new(rx, Box::new(watcher))))
+    }
+}
+
+fn local_notify_event_to_smb(root: &Path, event: notify::Event) -> Vec<WatchEvent> {
+    use notify::event::{EventKind, ModifyKind, RenameMode};
+
+    match event.kind {
+        EventKind::Create(kind) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Added, create_kind_is_dir(kind)).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: WATCH_CHANGE_NAME,
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Remove(kind) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Removed, remove_kind_is_dir(kind)).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: WATCH_CHANGE_NAME,
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Data(change)) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Modified, Some(path_is_dir(&path))).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: data_change_mask(change),
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Metadata(kind)) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Modified, Some(path_is_dir(&path))).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: metadata_change_mask(kind),
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            if event.paths.len() < 2 {
+                return Vec::new();
+            }
+            let from = event.paths[0].clone();
+            let to = event.paths[1].clone();
+            let is_directory = path_is_dir(&to);
+            match (
+                watch_record(root, &from, WatchAction::RenamedOld, Some(is_directory)),
+                watch_record(root, &to, WatchAction::RenamedNew, Some(is_directory)),
+            ) {
+                (Some(old), Some(new)) => vec![WatchEvent {
+                    records: vec![old, new],
+                    change: WATCH_CHANGE_NAME,
+                }],
+                _ => Vec::new(),
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(
+                    root,
+                    &path,
+                    WatchAction::RenamedOld,
+                    Some(path_is_dir(&path)),
+                )
+                .map(|record| WatchEvent {
+                    records: vec![record],
+                    change: WATCH_CHANGE_NAME,
+                })
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(
+            RenameMode::To | RenameMode::Any | RenameMode::Other,
+        )) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(
+                    root,
+                    &path,
+                    WatchAction::RenamedNew,
+                    Some(path_is_dir(&path)),
+                )
+                .map(|record| WatchEvent {
+                    records: vec![record],
+                    change: WATCH_CHANGE_NAME,
+                })
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Any | ModifyKind::Other) => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Modified, Some(path_is_dir(&path))).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: WATCH_CHANGE_ATTRIBUTES
+                            | WATCH_CHANGE_SIZE
+                            | WATCH_CHANGE_LAST_WRITE,
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Any => event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                watch_record(root, &path, WatchAction::Modified, Some(path_is_dir(&path))).map(
+                    |record| WatchEvent {
+                        records: vec![record],
+                        change: WATCH_CHANGE_ATTRIBUTES
+                            | WATCH_CHANGE_SIZE
+                            | WATCH_CHANGE_LAST_WRITE,
+                    },
+                )
+            })
+            .collect(),
+        EventKind::Access(_) | EventKind::Other => Vec::new(),
+    }
+}
+
+fn watch_record(
+    root: &Path,
+    path: &Path,
+    action: WatchAction,
+    forced_dir: Option<bool>,
+) -> Option<WatchRecord> {
+    Some(WatchRecord {
+        path: smb_path_from_local_path(root, path)?,
+        action,
+        is_directory: forced_dir.unwrap_or_else(|| path_is_dir(path)),
+    })
+}
+
+fn smb_path_from_local_path(root: &Path, path: &Path) -> Option<SmbPath> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut pieces = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => pieces.push(name.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    pieces.join("\\").parse().ok()
+}
+
+fn path_is_dir(path: &Path) -> bool {
+    path.metadata().map(|md| md.is_dir()).unwrap_or(false)
+}
+
+fn create_kind_is_dir(kind: CreateKind) -> Option<bool> {
+    match kind {
+        CreateKind::File => Some(false),
+        CreateKind::Folder => Some(true),
+        CreateKind::Any | CreateKind::Other => None,
+    }
+}
+
+fn remove_kind_is_dir(kind: RemoveKind) -> Option<bool> {
+    match kind {
+        RemoveKind::File => Some(false),
+        RemoveKind::Folder => Some(true),
+        RemoveKind::Any | RemoveKind::Other => None,
+    }
+}
+
+fn data_change_mask(change: DataChange) -> u32 {
+    match change {
+        DataChange::Any | DataChange::Size | DataChange::Content | DataChange::Other => {
+            WATCH_CHANGE_SIZE | WATCH_CHANGE_LAST_WRITE
+        }
+    }
+}
+
+fn metadata_change_mask(kind: MetadataKind) -> u32 {
+    match kind {
+        MetadataKind::AccessTime => WATCH_CHANGE_LAST_ACCESS,
+        MetadataKind::WriteTime => WATCH_CHANGE_LAST_WRITE,
+        MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Extended => {
+            WATCH_CHANGE_ATTRIBUTES
+        }
+        MetadataKind::Any | MetadataKind::Other => {
+            WATCH_CHANGE_ATTRIBUTES
+                | WATCH_CHANGE_CREATION
+                | WATCH_CHANGE_LAST_ACCESS
+                | WATCH_CHANGE_LAST_WRITE
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,12 +767,50 @@ enum LocalHandle {
     },
     Dir {
         name: String,
-        dir_handle: Arc<Dir>,
+        root: Arc<Dir>,
+        rel: PathBuf,
+        local_path: Arc<PathBuf>,
+        read_only: bool,
     },
 }
 
-fn file_name_for(path: &SmbPath) -> String {
-    path.file_name().unwrap_or("").to_string()
+async fn canonical_name_for_path(root: Arc<Dir>, path: SmbPath) -> SmbResult<String> {
+    spawn_blocking(move || canonical_display_path(&root, &path))
+        .await
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
+        .map_err(io_to_smb)
+}
+
+fn canonical_display_path(root: &Dir, path: &SmbPath) -> io::Result<String> {
+    if path.is_root() {
+        return Ok(String::new());
+    }
+
+    let mut out = Vec::new();
+    let mut dir = root.try_clone()?;
+    let last_index = path.components().len().saturating_sub(1);
+    for (index, component) in path.components().iter().enumerate() {
+        let actual = find_child_name_case_insensitive(&dir, component)?
+            .unwrap_or_else(|| component.to_string());
+        out.push(actual.clone());
+        if index != last_index {
+            dir = dir.open_dir(actual)?;
+        }
+    }
+    Ok(out.join("\\"))
+}
+
+fn find_child_name_case_insensitive(dir: &Dir, requested: &str) -> io::Result<Option<String>> {
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case(requested) {
+            return Ok(Some(name.into_owned()));
+        }
+    }
+    Ok(None)
 }
 
 #[async_trait]
@@ -534,12 +894,13 @@ impl Handle for LocalHandle {
                 .map_err(io_to_smb)
             }
             LocalHandle::Dir {
-                dir_handle, name, ..
+                root, rel, name, ..
             } => {
-                let dir_handle = Arc::clone(dir_handle);
+                let root = Arc::clone(root);
+                let rel = rel.clone();
                 let name = name.clone();
                 spawn_blocking(move || -> io::Result<FileInfo> {
-                    let md = dir_handle.dir_metadata()?;
+                    let md = root.metadata(&rel)?;
                     Ok(file_info_from_metadata(name, &md))
                 })
                 .await
@@ -560,29 +921,31 @@ impl Handle for LocalHandle {
                 }
                 let file = Arc::clone(file);
                 spawn_blocking(move || -> io::Result<()> {
-                    let mut std_times = std::fs::FileTimes::new();
-                    if let Some(ft) = times.last_write_time
-                        && let Some(t) = filetime_to_system_time(ft)
-                    {
-                        std_times = std_times.set_modified(t);
-                    }
-                    if let Some(ft) = times.last_access_time
-                        && let Some(t) = filetime_to_system_time(ft)
-                    {
-                        std_times = std_times.set_accessed(t);
-                    }
-                    // creation_time / change_time: stable std::fs::FileTimes
-                    // does not expose setters for these; silently ignored.
-                    file.set_times(std_times)
+                    file.set_times(std_file_times_from_smb(times))
                 })
                 .await
                 .map_err(join_to_io)
                 .map_err(io_to_smb)?
                 .map_err(io_to_smb)
             }
-            // cap-std's directory handle does not expose set_times in its
-            // stable API; mark as unsupported on directories.
-            LocalHandle::Dir { .. } => Err(SmbError::NotSupported),
+            LocalHandle::Dir {
+                local_path,
+                read_only,
+                ..
+            } => {
+                if *read_only {
+                    return Err(SmbError::AccessDenied);
+                }
+                let local_path = Arc::clone(local_path);
+                spawn_blocking(move || -> io::Result<()> {
+                    let dir = std::fs::File::open(local_path.as_ref())?;
+                    dir.set_times(std_file_times_from_smb(times))
+                })
+                .await
+                .map_err(join_to_io)
+                .map_err(io_to_smb)?
+                .map_err(io_to_smb)
+            }
         }
     }
 
@@ -610,12 +973,14 @@ impl Handle for LocalHandle {
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<SmbDirEntry>> {
         match self {
             LocalHandle::File { .. } => Err(SmbError::NotADirectory),
-            LocalHandle::Dir { dir_handle, .. } => {
-                let dir_handle = Arc::clone(dir_handle);
+            LocalHandle::Dir { root, rel, .. } => {
+                let root = Arc::clone(root);
+                let rel = rel.clone();
                 let pat = pattern.map(|s| s.to_owned());
                 spawn_blocking(move || -> io::Result<Vec<SmbDirEntry>> {
+                    let dir = root.open_dir(&rel)?;
                     let mut out = Vec::new();
-                    for entry in dir_handle.entries()? {
+                    for entry in dir.entries()? {
                         let entry = entry?;
                         let os_name = entry.file_name();
                         let Some(name) = os_name.to_str().map(str::to_owned) else {
@@ -746,6 +1111,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_under_missing_parent_returns_path_not_found() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let err = backend
+            .open(&p("missing/child.txt"), opts_create())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::PathNotFound));
+
+        std::fs::write(td.path().join("file-parent"), b"not a directory").unwrap();
+        let err = backend
+            .open(&p("file-parent/child.txt"), opts_create())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::NotADirectory));
+    }
+
+    #[tokio::test]
     async fn list_dir_finds_created_file() {
         let td = tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
@@ -759,6 +1145,25 @@ mod tests {
         let entries = dir_h.list_dir(None).await.unwrap();
         assert!(entries.iter().any(|e| e.info.name == "a.txt"));
         dir_h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn many_directory_handles_do_not_pin_directory_fds() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        std::fs::create_dir(td.path().join("watched")).unwrap();
+        std::fs::write(td.path().join("watched").join("child.txt"), b"child").unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..300 {
+            handles.push(backend.open(&p("watched"), opts_open_dir()).await.unwrap());
+        }
+
+        let info = handles[0].stat().await.unwrap();
+        assert!(info.is_directory);
+        let entries = handles[0].list_dir(Some("*")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].info.name, "child.txt");
     }
 
     #[tokio::test]
@@ -889,6 +1294,26 @@ mod tests {
         // "*" matches everything.
         let all = dir_h.list_dir(Some("*")).await.unwrap();
         assert_eq!(all.len(), 4);
+
+        dir_h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_handle_set_times_succeeds() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir(td.path().join("dir")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let dir_h = backend.open(&p("dir"), opts_open_dir()).await.unwrap();
+        let ft = system_time_to_filetime(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+
+        dir_h
+            .set_times(FileTimes {
+                last_access_time: Some(ft),
+                last_write_time: Some(ft),
+                ..FileTimes::default()
+            })
+            .await
+            .unwrap();
 
         dir_h.close().await.unwrap();
     }

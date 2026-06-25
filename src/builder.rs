@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -116,7 +117,13 @@ pub struct SmbServerBuilder {
     netbios_name: Option<String>,
     max_read_size: u32,
     max_write_size: u32,
+    max_credits: u16,
+    durable_handle_timeout: Duration,
+    cache_break_timeout: Duration,
     server_guid: Option<Uuid>,
+    require_signing: bool,
+    encrypt_data: bool,
+    disable_compression: bool,
 }
 
 impl Default for SmbServerBuilder {
@@ -133,9 +140,15 @@ impl SmbServerBuilder {
             user_order: Vec::new(),
             shares: Vec::new(),
             netbios_name: None,
-            max_read_size: 1024 * 1024,
-            max_write_size: 1024 * 1024,
+            max_read_size: 8 * 1024 * 1024,
+            max_write_size: 8 * 1024 * 1024,
+            max_credits: 8192,
+            durable_handle_timeout: Duration::from_secs(300),
+            cache_break_timeout: Duration::from_secs(35),
             server_guid: None,
+            require_signing: false,
+            encrypt_data: false,
+            disable_compression: false,
         }
     }
 
@@ -173,9 +186,39 @@ impl SmbServerBuilder {
         self
     }
 
+    pub fn max_credits(mut self, credits: u16) -> Self {
+        self.max_credits = credits.max(1);
+        self
+    }
+
+    pub fn durable_handle_timeout(mut self, timeout: Duration) -> Self {
+        self.durable_handle_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn cache_break_timeout(mut self, timeout: Duration) -> Self {
+        self.cache_break_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
     /// Override the random per-process server GUID. Mostly useful in tests.
     pub fn server_guid(mut self, guid: Uuid) -> Self {
         self.server_guid = Some(guid);
+        self
+    }
+
+    pub fn require_signing(mut self, required: bool) -> Self {
+        self.require_signing = required;
+        self
+    }
+
+    pub fn encrypt_data(mut self, required: bool) -> Self {
+        self.encrypt_data = required;
+        self
+    }
+
+    pub fn disable_compression(mut self, disabled: bool) -> Self {
+        self.disable_compression = disabled;
         self
     }
 
@@ -247,7 +290,13 @@ impl SmbServerBuilder {
             netbios_name: netbios,
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
+            max_credits: self.max_credits,
+            durable_handle_timeout: self.durable_handle_timeout,
+            cache_break_timeout: self.cache_break_timeout,
             server_guid,
+            require_signing: self.require_signing,
+            encrypt_data: self.encrypt_data,
+            disable_compression: self.disable_compression,
         };
         let users = ServerUsers {
             table: tokio::sync::RwLock::new(user_table),

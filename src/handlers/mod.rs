@@ -16,6 +16,7 @@ use crate::server::ServerState;
 mod change_notify;
 mod close;
 mod create;
+mod dcerpc;
 mod echo;
 mod flush;
 mod ioctl;
@@ -60,5 +61,6 @@ pub async fn dispatch_command(
         Command::SetInfo => set_info::handle(server, conn, hdr, body).await,
         Command::OplockBreak => oplock_break::handle(server, conn, hdr, body).await,
         Command::Cancel => HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+        Command::Unknown(_) => HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     }
 }

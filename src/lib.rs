@@ -16,6 +16,8 @@
 //! # Ok(()) }
 //! ```
 
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod backend;
 mod builder;
 pub(crate) mod conn;
@@ -28,17 +30,36 @@ pub(crate) mod info_class;
 pub mod ntstatus;
 mod path;
 mod proto;
+#[cfg(feature = "quic")]
+mod quic;
 mod server;
 mod utils;
 
-pub use backend::{DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend};
-pub use builder::{Access, Share};
+pub use backend::{
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
+    ShareBackend,
+};
+pub use builder::{Access, Share, SmbServerBuilder};
+pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
+pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
+#[cfg(feature = "quic")]
+pub use quic::{
+    DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW, DEFAULT_QUIC_KEEP_ALIVE_INTERVAL,
+    DEFAULT_QUIC_MAX_IDLE_TIMEOUT, DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, SMB_QUIC_ALPN,
+    SmbQuicConfig, SmbQuicConfigError, SmbQuicEndpointError, smb_quic_endpoint,
+    smb_quic_server_config,
+};
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 
 pub mod wire {
+    pub mod crypto {
+        pub use crate::proto::crypto::{
+            SigningAlgo, sign, signing_key_30, signing_key_311, verify,
+        };
+    }
     pub use crate::proto::header;
     pub use crate::proto::messages;
 }

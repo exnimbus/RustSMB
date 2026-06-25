@@ -4,7 +4,7 @@ use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
 use super::create::FileId;
-use crate::proto::error::ProtoResult;
+use crate::proto::error::{ProtoError, ProtoResult};
 
 #[binrw]
 #[brw(little)]
@@ -21,7 +21,14 @@ impl CloseRequest {
     pub const FLAG_POSTQUERY_ATTRIB: u16 = 0x0001;
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 24 {
+            return Err(ProtoError::Malformed("close request too short"));
+        }
+        let request = Self::read(&mut Cursor::new(buf))?;
+        if request.structure_size != 24 {
+            return Err(ProtoError::Malformed("close request structure_size != 24"));
+        }
+        Ok(request)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -56,7 +63,14 @@ impl CloseResponse {
     }
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 60 {
+            return Err(ProtoError::Malformed("close response too short"));
+        }
+        let response = Self::read(&mut Cursor::new(buf))?;
+        if response.structure_size != 60 {
+            return Err(ProtoError::Malformed("close response structure_size != 60"));
+        }
+        Ok(response)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -89,5 +103,27 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(CloseResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn request_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 24];
+        buf[0..2].copy_from_slice(&23u16.to_le_bytes());
+
+        assert!(matches!(
+            CloseRequest::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn response_rejects_wrong_structure_size() {
+        let mut buf = vec![0; 60];
+        buf[0..2].copy_from_slice(&59u16.to_le_bytes());
+
+        assert!(matches!(
+            CloseResponse::parse(&buf),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

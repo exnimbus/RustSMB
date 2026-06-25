@@ -38,8 +38,8 @@ pub mod flags {
     pub const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
     pub const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
     pub const NTLMSSP_NEGOTIATE_SIGN: u32 = 0x0000_0010;
+    pub const NTLMSSP_NEGOTIATE_SEAL: u32 = 0x0000_0020;
     pub const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
-    #[cfg(test)]
     pub const NTLMSSP_NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
     pub const NTLMSSP_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
     pub const NTLMSSP_TARGET_TYPE_SERVER: u32 = 0x0002_0000;
@@ -102,7 +102,6 @@ pub fn encode_av_pairs(pairs: &[AvPair]) -> Vec<u8> {
 }
 
 /// Decode AV_PAIRs from a byte slice; stops at (and consumes) the EOL entry.
-#[cfg(test)]
 pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -127,6 +126,25 @@ pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
         i += len;
     }
     Ok(out)
+}
+
+fn validate_ntlmv2_client_challenge(buf: &[u8]) -> ProtoResult<()> {
+    if buf.len() < 28 {
+        return Err(ProtoError::Malformed("NTLMv2 client challenge too short"));
+    }
+    if buf[0] != 0x01 || buf[1] != 0x01 || buf[2..8] != [0u8; 6] {
+        return Err(ProtoError::Malformed(
+            "NTLMv2 client challenge fixed fields invalid",
+        ));
+    }
+    if buf[24..28] != [0u8; 4] {
+        return Err(ProtoError::Malformed(
+            "NTLMv2 client challenge reserved field invalid",
+        ));
+    }
+    decode_av_pairs(&buf[28..])
+        .map(|_| ())
+        .map_err(|_| ProtoError::Malformed("NTLMv2 client challenge AV_PAIR list invalid"))
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -321,6 +339,7 @@ pub fn build_challenge(p: &ChallengeParams<'_>) -> Vec<u8> {
         AvPair::new(AvId::DnsDomainName, utf16le(p.dns_domain_name)),
         AvPair::new(AvId::DnsComputerName, utf16le(p.dns_computer_name)),
         AvPair::new(AvId::Timestamp, p.timestamp.to_le_bytes().to_vec()),
+        AvPair::new(AvId::Flags, 0x02u32.to_le_bytes().to_vec()),
     ];
     let target_info = encode_av_pairs(&av_pairs);
 
@@ -506,6 +525,7 @@ pub enum Identity {
 pub struct AuthOutcome {
     pub identity: Identity,
     pub session_key: [u8; 16],
+    pub flags: u32,
 }
 
 /// Caller-supplied user record. We store only the precomputed NT hash —
@@ -591,6 +611,7 @@ impl NtlmServer {
             | flags::NTLMSSP_REQUEST_TARGET
             | flags::NTLMSSP_NEGOTIATE_NTLM
             | flags::NTLMSSP_NEGOTIATE_SIGN
+            | flags::NTLMSSP_NEGOTIATE_SEAL
             | flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
             | flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
             | flags::NTLMSSP_TARGET_TYPE_SERVER
@@ -660,10 +681,25 @@ impl NtlmServer {
 
         // ---- Anonymous fast path. MS-NLMP §3.2.5.1.2: empty user + empty NT
         // response (or single-zero-byte LM response) means anonymous logon.
-        if auth.user.is_empty() && auth.nt_response.is_empty() {
+        if (auth.flags & flags::NTLMSSP_NEGOTIATE_ANONYMOUS) != 0
+            || (auth.user.is_empty() && auth.nt_response.is_empty())
+        {
+            let mut session_key = [0u8; 16];
+            if (auth.flags & flags::NTLMSSP_NEGOTIATE_KEY_EXCH) != 0
+                && !auth.encrypted_random_session_key.is_empty()
+            {
+                if auth.encrypted_random_session_key.len() != 16 {
+                    return Err(ProtoError::Auth("encrypted session key not 16 bytes"));
+                }
+                session_key.copy_from_slice(&auth.encrypted_random_session_key);
+                let mut rc4 = Rc4::new_from_slice(&[0u8; 16])
+                    .map_err(|_| ProtoError::Auth("rc4 key length"))?;
+                rc4.apply_keystream(&mut session_key);
+            }
             return Ok(AuthOutcome {
                 identity: Identity::Anonymous,
-                session_key: [0u8; 16],
+                session_key,
+                flags: auth.flags,
             });
         }
 
@@ -679,6 +715,7 @@ impl NtlmServer {
             return Err(ProtoError::Auth("NT response too short"));
         }
         let (nt_proof_supplied, client_challenge) = auth.nt_response.split_at(16);
+        validate_ntlmv2_client_challenge(client_challenge)?;
 
         // ---- NTProofStr = HMAC_MD5(response_key_nt, ServerChallenge || ClientChallenge)
         let mut mac = HmacMd5::new_from_slice(&response_key_nt).expect("hmac key");
@@ -747,8 +784,60 @@ impl NtlmServer {
                 domain: auth.domain.clone(),
             },
             session_key,
+            flags: auth.flags,
         })
     }
+
+    pub fn sign_server_message(
+        session_key: &[u8; 16],
+        flags: u32,
+        seq_num: u32,
+        msg: &[u8],
+    ) -> ProtoResult<Vec<u8>> {
+        ntlmssp_sign_server_message(session_key, flags, seq_num, msg)
+    }
+}
+
+fn ntlmssp_sign_server_message(
+    session_key: &[u8; 16],
+    flags: u32,
+    seq_num: u32,
+    msg: &[u8],
+) -> ProtoResult<Vec<u8>> {
+    const SERVER_SIGNING_MAGIC: &[u8] =
+        b"session key to server-to-client signing key magic constant\0";
+    const SERVER_SEALING_MAGIC: &[u8] =
+        b"session key to server-to-client sealing key magic constant\0";
+
+    let mut signing_material = Vec::with_capacity(session_key.len() + SERVER_SIGNING_MAGIC.len());
+    signing_material.extend_from_slice(session_key);
+    signing_material.extend_from_slice(SERVER_SIGNING_MAGIC);
+    let signing_key = Md5::digest(&signing_material);
+
+    let seq = seq_num.to_le_bytes();
+    let mut mac = HmacMd5::new_from_slice(&signing_key).expect("HMAC accepts any key length");
+    mac.update(&seq);
+    mac.update(msg);
+    let digest = mac.finalize().into_bytes();
+    let mut checksum = [0u8; 8];
+    checksum.copy_from_slice(&digest[..8]);
+
+    if flags & flags::NTLMSSP_NEGOTIATE_KEY_EXCH != 0 {
+        let mut sealing_material =
+            Vec::with_capacity(session_key.len() + SERVER_SEALING_MAGIC.len());
+        sealing_material.extend_from_slice(session_key);
+        sealing_material.extend_from_slice(SERVER_SEALING_MAGIC);
+        let sealing_key = Md5::digest(&sealing_material);
+        let mut rc4 =
+            Rc4::new_from_slice(&sealing_key).map_err(|_| ProtoError::Auth("rc4 key length"))?;
+        rc4.apply_keystream(&mut checksum);
+    }
+
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&checksum);
+    out.extend_from_slice(&seq);
+    Ok(out)
 }
 
 // ===========================================================================
@@ -824,6 +913,59 @@ mod tests {
         let av = decode_av_pairs(&blob[ti_off..ti_off + ti_len]).unwrap();
         assert!(av.iter().any(|p| p.id == AvId::NbDomainName as u16));
         assert!(av.iter().any(|p| p.id == AvId::Timestamp as u16));
+        assert_eq!(
+            av.iter()
+                .find(|p| p.id == AvId::Flags as u16)
+                .map(|p| p.value.as_slice()),
+            Some(0x02u32.to_le_bytes().as_slice())
+        );
+    }
+
+    #[test]
+    fn server_challenge_preserves_client_requested_seal_flag() {
+        let mut srv = NtlmServer::new(
+            [0u8; 8],
+            NtlmTargetInfo::new("SERVER", "DOMAIN", "SERVER", "d.local", "s.d.local"),
+            0,
+        );
+        let client_flags = flags::NTLMSSP_NEGOTIATE_UNICODE
+            | flags::NTLMSSP_REQUEST_TARGET
+            | flags::NTLMSSP_NEGOTIATE_SIGN
+            | flags::NTLMSSP_NEGOTIATE_SEAL
+            | flags::NTLMSSP_NEGOTIATE_NTLM
+            | flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+            | flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+            | flags::NTLMSSP_NEGOTIATE_TARGET_INFO
+            | flags::NTLMSSP_NEGOTIATE_VERSION
+            | flags::NTLMSSP_NEGOTIATE_128
+            | flags::NTLMSSP_NEGOTIATE_KEY_EXCH
+            | flags::NTLMSSP_NEGOTIATE_56;
+        let mut negotiate = Vec::new();
+        negotiate.extend_from_slice(NTLMSSP_SIGNATURE);
+        negotiate.extend_from_slice(&MSG_NEGOTIATE.to_le_bytes());
+        negotiate.extend_from_slice(&client_flags.to_le_bytes());
+        negotiate.extend_from_slice(&[0u8; 8]);
+        negotiate.extend_from_slice(&[0u8; 8]);
+        negotiate.extend_from_slice(&[0u8; 8]);
+
+        srv.step1_negotiate(&negotiate).unwrap();
+        let challenge = srv.challenge();
+        let challenge_flags = u32::from_le_bytes(challenge[20..24].try_into().unwrap());
+        assert!(challenge_flags & flags::NTLMSSP_NEGOTIATE_SEAL != 0);
+    }
+
+    #[test]
+    fn server_message_signature_is_ntlmssp_wire_signature() {
+        let sig = NtlmServer::sign_server_message(
+            &[0x11; 16],
+            flags::NTLMSSP_NEGOTIATE_KEY_EXCH,
+            0,
+            b"\x30\x0c\x06\x0aexample",
+        )
+        .unwrap();
+        assert_eq!(sig.len(), 16);
+        assert_eq!(&sig[0..4], &1u32.to_le_bytes());
+        assert_eq!(&sig[12..16], &0u32.to_le_bytes());
     }
 
     /// MS-NLMP §4.2.4 known-answer test for NTLMv2:

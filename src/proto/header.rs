@@ -63,8 +63,7 @@ pub const SMB2_FLAGS_REPLAY_OPERATION: u32 = 0x2000_0000;
 // ---------------------------------------------------------------------------
 
 /// SMB2 command opcodes (the 19 commands in v1).
-#[binrw]
-#[brw(little, repr = u16)]
+#[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
     Negotiate = 0x0000,
@@ -86,12 +85,59 @@ pub enum Command {
     QueryInfo = 0x0010,
     SetInfo = 0x0011,
     OplockBreak = 0x0012,
+    Unknown(u16),
 }
 
 impl Command {
     /// Raw opcode for diagnostics.
     pub const fn as_u16(self) -> u16 {
-        self as u16
+        match self {
+            Command::Negotiate => 0x0000,
+            Command::SessionSetup => 0x0001,
+            Command::Logoff => 0x0002,
+            Command::TreeConnect => 0x0003,
+            Command::TreeDisconnect => 0x0004,
+            Command::Create => 0x0005,
+            Command::Close => 0x0006,
+            Command::Flush => 0x0007,
+            Command::Read => 0x0008,
+            Command::Write => 0x0009,
+            Command::Lock => 0x000A,
+            Command::Ioctl => 0x000B,
+            Command::Cancel => 0x000C,
+            Command::Echo => 0x000D,
+            Command::QueryDirectory => 0x000E,
+            Command::ChangeNotify => 0x000F,
+            Command::QueryInfo => 0x0010,
+            Command::SetInfo => 0x0011,
+            Command::OplockBreak => 0x0012,
+            Command::Unknown(raw) => raw,
+        }
+    }
+
+    pub const fn from_u16(raw: u16) -> Self {
+        match raw {
+            0x0000 => Command::Negotiate,
+            0x0001 => Command::SessionSetup,
+            0x0002 => Command::Logoff,
+            0x0003 => Command::TreeConnect,
+            0x0004 => Command::TreeDisconnect,
+            0x0005 => Command::Create,
+            0x0006 => Command::Close,
+            0x0007 => Command::Flush,
+            0x0008 => Command::Read,
+            0x0009 => Command::Write,
+            0x000A => Command::Lock,
+            0x000B => Command::Ioctl,
+            0x000C => Command::Cancel,
+            0x000D => Command::Echo,
+            0x000E => Command::QueryDirectory,
+            0x000F => Command::ChangeNotify,
+            0x0010 => Command::QueryInfo,
+            0x0011 => Command::SetInfo,
+            0x0012 => Command::OplockBreak,
+            raw => Command::Unknown(raw),
+        }
     }
 }
 
@@ -227,12 +273,7 @@ impl Smb2Header {
         if raw.structure_size != SMB2_HEADER_STRUCTURE_SIZE {
             return Err(ProtoError::Malformed("SMB2 header structure_size != 64"));
         }
-        let command = match Command::read_le(&mut Cursor::new(raw.command_raw.to_le_bytes())) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(ProtoError::Malformed("unknown SMB2 command opcode"));
-            }
-        };
+        let command = Command::from_u16(raw.command_raw);
         let tail = if raw.flags & SMB2_FLAGS_ASYNC_COMMAND != 0 {
             HeaderTail::Async {
                 async_id: u64::from_le_bytes(raw.tail_bytes),
@@ -396,6 +437,58 @@ mod tests {
     }
 
     #[test]
+    fn sync_header_round_trip_matches_gosmb_fixture() {
+        let hdr = Smb2Header {
+            command: Command::TreeConnect,
+            credit_request_response: 7,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            message_id: 42,
+            tail: HeaderTail::sync(9),
+            session_id: 11,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        hdr.write(&mut buf).unwrap();
+
+        let (decoded, rest) = Smb2Header::parse(&buf).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(decoded.command, Command::TreeConnect);
+        assert_eq!(decoded.credit_request_response, 7);
+        assert_eq!(decoded.flags, SMB2_FLAGS_SERVER_TO_REDIR);
+        assert_eq!(decoded.message_id, 42);
+        assert_eq!(decoded.tree_id(), Some(9));
+        assert_eq!(decoded.session_id, 11);
+    }
+
+    #[test]
+    fn async_header_round_trip_matches_gosmb_fixture() {
+        let hdr = Smb2Header {
+            command: Command::ChangeNotify,
+            credit_request_response: 3,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND,
+            message_id: 99,
+            tail: HeaderTail::async_(12345),
+            session_id: 11,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        hdr.write(&mut buf).unwrap();
+
+        let (decoded, rest) = Smb2Header::parse(&buf).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(decoded.command, Command::ChangeNotify);
+        assert_eq!(decoded.credit_request_response, 3);
+        assert_eq!(
+            decoded.flags,
+            SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND
+        );
+        assert_eq!(decoded.message_id, 99);
+        assert_eq!(decoded.async_id(), Some(12345));
+        assert_eq!(decoded.tree_id(), None);
+        assert_eq!(decoded.session_id, 11);
+    }
+
+    #[test]
     fn rejects_bad_magic() {
         let hdr = sample_sync();
         let mut buf = Vec::new();
@@ -438,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn command_round_trips_via_binrw() {
+    fn command_round_trips() {
         for cmd in [
             Command::Negotiate,
             Command::SessionSetup,
@@ -459,6 +552,7 @@ mod tests {
             Command::QueryInfo,
             Command::SetInfo,
             Command::OplockBreak,
+            Command::Unknown(0x00ff),
         ] {
             let mut hdr = sample_sync();
             hdr.command = cmd;
@@ -467,5 +561,18 @@ mod tests {
             let (decoded, _) = Smb2Header::parse(&buf).unwrap();
             assert_eq!(decoded.command, cmd);
         }
+    }
+
+    #[test]
+    fn unknown_command_preserves_raw_opcode() {
+        let mut buf = vec![0u8; 64];
+        buf[..4].copy_from_slice(&SMB2_MAGIC);
+        buf[4..6].copy_from_slice(&64u16.to_le_bytes());
+        buf[12..14].copy_from_slice(&0x00ffu16.to_le_bytes());
+
+        let (hdr, rest) = Smb2Header::parse(&buf).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(hdr.command, Command::Unknown(0x00ff));
+        assert_eq!(hdr.command.as_u16(), 0x00ff);
     }
 }

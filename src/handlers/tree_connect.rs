@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::proto::auth::ntlm::Identity;
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{TreeConnectRequest, TreeConnectResponse};
+use crate::proto::messages::{Dialect, TreeConnectRequest, TreeConnectResponse};
 use tracing::{info, warn};
 
 use crate::builder::Access;
@@ -36,8 +36,8 @@ pub async fn handle(
     let share_name = match extract_share_name(&path) {
         Some(s) => s,
         None => {
-            tracing::warn!(%path, "tree connect: empty share name");
-            return HandlerResponse::err(ntstatus::STATUS_BAD_NETWORK_NAME);
+            tracing::warn!(%path, "tree connect: malformed UNC path");
+            return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
     };
     tracing::debug!(%share_name, "tree connect lookup");
@@ -94,15 +94,16 @@ pub async fn handle(
         Access::Read => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         Access::ReadWrite => FILE_ALL_ACCESS,
     };
+    let share_type = if share.is_ipc {
+        SHARE_TYPE_PIPE
+    } else {
+        SHARE_TYPE_DISK
+    };
     let resp = TreeConnectResponse {
         structure_size: 16,
-        share_type: if share.is_ipc {
-            SHARE_TYPE_PIPE
-        } else {
-            SHARE_TYPE_DISK
-        },
+        share_type,
         reserved: 0,
-        share_flags: 0,
+        share_flags: share_flags(server, conn, share_type).await,
         capabilities: 0,
         maximal_access,
     };
@@ -114,14 +115,39 @@ pub async fn handle(
     hr
 }
 
+async fn share_flags(server: &Arc<ServerState>, conn: &Arc<Connection>, share_type: u8) -> u32 {
+    if share_type == SHARE_TYPE_PIPE {
+        return TreeConnectResponse::SHARE_FLAG_NO_CACHING;
+    }
+
+    let mut flags = TreeConnectResponse::SHARE_FLAG_MANUAL_CACHING;
+    let transport_security = *conn.transport_security.read().await;
+    if server.config.encrypt_data && !transport_security {
+        flags |= TreeConnectResponse::SHARE_FLAG_ENCRYPT_DATA;
+    }
+    let dialect = *conn.dialect.read().await;
+    let compression_algorithm = *conn.compression_algorithm.read().await;
+    if dialect == Some(Dialect::Smb311) && compression_algorithm != 0 {
+        flags |= TreeConnectResponse::SHARE_FLAG_COMPRESS_DATA;
+    }
+    if dialect == Some(Dialect::Smb311) && transport_security {
+        flags |= TreeConnectResponse::SHARE_FLAG_ISOLATED_TRANSPORT;
+    }
+    flags
+}
+
 fn extract_share_name(unc: &str) -> Option<String> {
-    // \\server\share or \\server\share\
-    let trimmed = unc.trim_end_matches(['\\', '/']);
-    let parts: Vec<&str> = trimmed
-        .split(['\\', '/'])
-        .filter(|s| !s.is_empty())
-        .collect();
-    parts.last().map(|s| s.to_string())
+    let normalized = unc.replace('/', "\\");
+    if !normalized.starts_with(r"\\") {
+        return None;
+    }
+
+    let parts: Vec<&str> = normalized.trim_matches('\\').split('\\').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return None;
+    }
+
+    Some(parts[1].to_ascii_lowercase())
 }
 
 fn authorize(
@@ -136,5 +162,115 @@ fn authorize(
             Identity::Anonymous => None,
             Identity::User { user, .. } => users.get(user).copied(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SmbServer;
+    use crate::proto::messages::CompressionCapabilities;
+    use uuid::Uuid;
+
+    fn test_conn() -> Arc<Connection> {
+        Arc::new(Connection::new(
+            Uuid::nil(),
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+            8,
+        ))
+    }
+
+    fn test_server(encrypt_data: bool) -> Arc<ServerState> {
+        SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .encrypt_data(encrypt_data)
+            .build()
+            .expect("server builds")
+            .state()
+    }
+
+    #[test]
+    fn extract_share_name_accepts_unc_server_and_share() {
+        assert_eq!(
+            extract_share_name(r"\\host\VIRTUAL"),
+            Some("virtual".to_string())
+        );
+        assert_eq!(
+            extract_share_name(r"\\host\VIRTUAL\"),
+            Some("virtual".to_string())
+        );
+        assert_eq!(
+            extract_share_name("//host/VIRTUAL"),
+            Some("virtual".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_share_name_rejects_malformed_unc_paths() {
+        for path in [
+            "VIRTUAL",
+            r"\host\VIRTUAL",
+            r"\\host",
+            r"\\host\",
+            r"\\host\VIRTUAL\extra",
+        ] {
+            assert_eq!(extract_share_name(path), None, "path {path:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_share_flags_reflect_encryption_and_compression_policy() {
+        let server = test_server(true);
+        let conn = test_conn();
+        *conn.dialect.write().await = Some(Dialect::Smb311);
+        *conn.compression_algorithm.write().await = CompressionCapabilities::ALGORITHM_LZ77;
+
+        let flags = share_flags(&server, &conn, SHARE_TYPE_DISK).await;
+
+        assert_ne!(flags & TreeConnectResponse::SHARE_FLAG_ENCRYPT_DATA, 0);
+        assert_ne!(flags & TreeConnectResponse::SHARE_FLAG_COMPRESS_DATA, 0);
+        assert_eq!(
+            flags & TreeConnectResponse::SHARE_FLAG_ISOLATED_TRANSPORT,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_share_flags_use_isolated_transport_when_transport_security_is_accepted() {
+        let server = test_server(true);
+        let conn = test_conn();
+        *conn.dialect.write().await = Some(Dialect::Smb311);
+        *conn.transport_security.write().await = true;
+
+        let flags = share_flags(&server, &conn, SHARE_TYPE_DISK).await;
+
+        assert_eq!(flags & TreeConnectResponse::SHARE_FLAG_ENCRYPT_DATA, 0);
+        assert_ne!(
+            flags & TreeConnectResponse::SHARE_FLAG_ISOLATED_TRANSPORT,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_share_flags_default_to_manual_caching() {
+        let server = test_server(false);
+        let conn = test_conn();
+
+        let flags = share_flags(&server, &conn, SHARE_TYPE_DISK).await;
+
+        assert_eq!(flags, TreeConnectResponse::SHARE_FLAG_MANUAL_CACHING);
+    }
+
+    #[tokio::test]
+    async fn ipc_share_flags_use_no_caching_without_disk_policy_bits() {
+        let server = test_server(true);
+        let conn = test_conn();
+        *conn.dialect.write().await = Some(Dialect::Smb311);
+        *conn.compression_algorithm.write().await = CompressionCapabilities::ALGORITHM_LZ77;
+
+        let flags = share_flags(&server, &conn, SHARE_TYPE_PIPE).await;
+
+        assert_eq!(flags, TreeConnectResponse::SHARE_FLAG_NO_CACHING);
     }
 }

@@ -29,7 +29,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// `fixed_input = [0,0,0,1] || label || 0x00 || context || [0,0,0,0x80]`.
 /// The single separator `0x00` between `label` and `context` is required for
 /// Windows interop; do not remove.
-pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
+pub fn smb2_kdf_bytes(key: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA-256 accepts keys of any length");
 
@@ -43,12 +43,17 @@ pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
     // Context (including trailing NUL provided by caller, or for 3.1.1 the
     // 64-byte preauth hash)
     mac.update(context);
-    // L = 128 bits (big-endian u32)
-    mac.update(&[0x00, 0x00, 0x00, 0x80]);
+    // L = output length in bits (big-endian u32).
+    mac.update(&((len as u32) * 8).to_be_bytes());
 
     let full = mac.finalize().into_bytes();
+    full[..len].to_vec()
+}
+
+pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
+    let full = smb2_kdf_bytes(key, label, context, 16);
     let mut out = [0u8; 16];
-    out.copy_from_slice(&full[..16]);
+    out.copy_from_slice(&full);
     out
 }
 
